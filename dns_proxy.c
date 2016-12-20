@@ -47,6 +47,7 @@ char *GROUPNAME = "nobody";
 int NUM_DNS = 0;
 int LOG = 0;
 char **dns_servers;
+char *m_local_resolvconf = "/etc/resolv.conf";
 
 typedef struct {
   char *buffer;
@@ -106,6 +107,8 @@ void parse_config(char *file) {
       RESOLVCONF = string_value(get_value(line));
     else if(strstr(line, "log_file") != NULL)
       LOGFILE = string_value(get_value(line));
+    else if(strstr(line, "local_resolv_conf") != NULL)
+      m_local_resolvconf = string_value(get_value(line));
   }
   if (fclose(f) != 0)
 	  error("[!] Error closing configuration file");
@@ -146,6 +149,7 @@ void parse_resolv_conf() {
 
 // handle children
 void reaper_handle (int sig) {
+  (void) sig;
   while (waitpid(-1, NULL, WNOHANG) > 0) { };
 }
 
@@ -209,13 +213,14 @@ int udp_listener() {
   if(bind(sock, (struct sockaddr*)&dns_listener, sizeof(dns_listener)) < 0)
     error("[!] Error binding on dns proxy");
 
-  FILE *resolv = fopen("/etc/resolv.conf", "w");
+  FILE *resolv = fopen(m_local_resolvconf, "w");
 
   if (!resolv)
-    error("[!] Error opening /etc/resolv.conf");
-
-  fprintf(resolv, "nameserver %s\n", LISTEN_ADDR);
-  fclose(resolv);
+    fprintf(stderr, "[!] Error opening %s: %s\n", m_local_resolvconf, strerror(errno));
+  else {
+    fprintf(resolv, "nameserver %s\n", LISTEN_ADDR);
+    fclose(resolv);
+  }
 
   if (strcmp(LOGFILE, "/dev/null") != 0) {
     LOG      = 1;
@@ -306,6 +311,7 @@ int main(int argc, char *argv[]) {
       printf("   * set_group    = nobody\n");
       printf("   * resolv_conf  = resolv.conf\n");
       printf("   * log_file     = /dev/null\n");
+      printf("   * local_resolv_conf = /etc/resolv.conf\n");
       exit(0);
     }
     else {
