@@ -2,9 +2,11 @@
 
 A simple dns proxy to tunnel DNS requests over a socks proxy (for example, over ssh or Tor). This can come in handy when setting up transparent proxies.
 
-It chooses a random DNS server for each request from the file "resolv.conf" which is a newline delimited list of DNS servers. 
+It chooses a random DNS server for each request from the file "resolv.conf" which is a newline delimited list of DNS servers.
 
 The daemon must be run as root in order for it to bind to port 53.
+
+Can use in Linux, Unix, and OpenWRT.
 
 ## Usage
 

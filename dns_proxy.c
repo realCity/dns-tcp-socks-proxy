@@ -29,34 +29,61 @@
 #include <sys/types.h>
 #include <pwd.h>
 #include <grp.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <errno.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
 
 int   SOCKS_PORT  = 9050;
-char *SOCKS_ADDR  = { "127.0.0.1" };
+char *SOCKS_ADDR  = "127.0.0.1";
 int   LISTEN_PORT = 53;
-char *LISTEN_ADDR = { "0.0.0.0" };
+char *LISTEN_ADDR = "0.0.0.0";
 
-FILE *LOG_FILE;
+FILE *LOG_FILE = NULL;
 char *RESOLVCONF = "resolv.conf";
 char *LOGFILE = "/dev/null";
 char *USERNAME = "nobody";
 char *GROUPNAME = "nobody";
 int NUM_DNS = 0;
-int LOG = 0;
-char **dns_servers;
-char *m_local_resolvconf = "/etc/resolv.conf";
+static int m_cur_dns = 0;
+char **dns_servers = NULL;
+static char *m_local_resolvconf = "/etc/resolv.conf";
+static uint8_t m_daemonize = 1;
+static pthread_mutex_t m_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
   char *buffer;
   int length;
 } response;
 
+typedef struct {
+	response resp;
+	int sock;
+	struct sockaddr_in client;
+} queryargs;
+
 void error(char *e) {
   perror(e);
   exit(1);
+}
+
+void mylog(const char *message, ...) {
+	if (!LOG_FILE) { return; }
+
+	pthread_mutex_lock(&m_log_mutex);
+	va_list ap;
+	va_start(ap, message);
+	int ret = vfprintf(LOG_FILE, message, ap);
+	va_end(ap);
+	if (ret < 0) {
+		fprintf(stderr, "write log file error\n");
+	} else {
+		fputc('\n', LOG_FILE);
+		fflush(LOG_FILE);
+	}
+	pthread_mutex_unlock(&m_log_mutex);
 }
 
 char *get_value(char *line) {
@@ -72,8 +99,8 @@ char *get_value(char *line) {
 }
 
 char *string_value(char *value) {
-  char *tmp = (char*)malloc(strlen(value)+1);
-  strcpy(tmp, value);
+  char *tmp = strdup(value);
+  if (!tmp) { error("[!] Out of memory"); }
   value = tmp;
   if (value[strlen(value)-1] == '\n')
     value[strlen(value)-1] = '\0';
@@ -81,37 +108,43 @@ char *string_value(char *value) {
 }
 
 void parse_config(char *file) {
-  char line[80];
+  char line[128];
+  char *s;
 
   FILE *f = fopen(file, "r");
-  if (!f)
-    error("[!] Error opening configuration file");
-
-  while (fgets(line, 80, f) != NULL) {
-    if (line[0] == '#')
-      continue;
-
-    if(strstr(line, "socks_port") != NULL) 
-      SOCKS_PORT = strtol(get_value(line), NULL, 10);
-    else if(strstr(line, "socks_addr") != NULL)
-      SOCKS_ADDR = string_value(get_value(line));
-    else if(strstr(line, "listen_addr") != NULL)
-      LISTEN_ADDR = string_value(get_value(line));
-    else if(strstr(line, "listen_port") != NULL)
-      LISTEN_PORT = strtol(get_value(line), NULL, 10);
-    else if(strstr(line, "set_user") != NULL)
-      USERNAME = string_value(get_value(line));
-    else if(strstr(line, "set_group") != NULL)
-      GROUPNAME = string_value(get_value(line));
-    else if(strstr(line, "resolv_conf") != NULL)
-      RESOLVCONF = string_value(get_value(line));
-    else if(strstr(line, "log_file") != NULL)
-      LOGFILE = string_value(get_value(line));
-    else if(strstr(line, "local_resolv_conf") != NULL)
-      m_local_resolvconf = string_value(get_value(line));
+  if (!f) {
+	  fprintf(stderr, "[!] Error opening configuration file %s: %s", file, strerror(errno));
+	  exit(1);
   }
-  if (fclose(f) != 0)
-	  error("[!] Error closing configuration file");
+
+  while (fgets(line, sizeof(line), f)) {
+    s = line;
+    while (isspace(*s)) s++;
+    if (s[0] == '\0' || s[0] == '#') continue;
+
+    if(!strncmp(s, "socks_port", 10))
+      SOCKS_PORT = strtol(get_value(s), NULL, 10);
+    else if(!strncmp(s, "socks_addr", 10))
+      SOCKS_ADDR = string_value(get_value(s));
+    else if(!strncmp(s, "listen_addr", 11))
+      LISTEN_ADDR = string_value(get_value(s));
+    else if(!strncmp(s, "listen_port", 11))
+      LISTEN_PORT = strtol(get_value(s), NULL, 10);
+    else if(!strncmp(s, "set_user", 8))
+      USERNAME = string_value(get_value(s));
+    else if(!strncmp(s, "set_group", 9))
+      GROUPNAME = string_value(get_value(s));
+    else if(!strncmp(s, "resolv_conf", 11))
+      RESOLVCONF = string_value(get_value(s));
+    else if(!strncmp(s, "log_file", 8))
+      LOGFILE = string_value(get_value(s));
+    else if(!strncmp(s, "local_resolv_conf", 17))
+      m_local_resolvconf = string_value(get_value(s));
+    else if(!strncmp(s, "foreground", 10))
+      m_daemonize = !strtol(get_value(s), NULL, 10);
+  }
+
+  fclose(f);
 }
 
 void parse_resolv_conf() {
@@ -119,42 +152,43 @@ void parse_resolv_conf() {
   int i = 0;
   regex_t preg;
   regmatch_t pmatch[1];
-  regcomp(&preg, "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\n$", REG_EXTENDED);
+  regcomp(&preg, "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\n?$", REG_EXTENDED);
 
   FILE *f = fopen(RESOLVCONF, "r");
-  if (!f)
-    error("[!] Error opening resolv.conf");
+  if (!f) {
+	  fprintf(stderr, "[!] Error opening %s: %s\n", RESOLVCONF, strerror(errno));
+	  exit(1);
+  }
 
   while (fgets(ns, 80, f) != NULL) {
     if (!regexec(&preg, ns, 1, pmatch, 0))
       NUM_DNS++;
   }
+  if (NUM_DNS < 1) {
+	  fprintf(stderr, "[!] No name server in %s\n", RESOLVCONF);
+	  exit(1);
+  }
 
-  if (fclose(f))
-    error("[!] Error closing resolv.conf");
-  
-  dns_servers = malloc(sizeof(char*) * NUM_DNS);
+  dns_servers = calloc(NUM_DNS, sizeof(char *));
+  if (!dns_servers) { error("[!] Out of memory"); }
 
-  f = fopen(RESOLVCONF, "r");
+  rewind(f);
+  size_t slen;
   while (fgets(ns, 80, f) != NULL) {
     if (regexec(&preg, ns, 1, pmatch, 0) != 0)
       continue;
-    dns_servers[i] = (char*)malloc(strlen(ns) + 1);
-    strcpy(dns_servers[i], ns);
+    slen = strlen(ns);
+    if (ns[slen - 1] == '\n') { ns[slen - 1] = '\0'; }
+    dns_servers[i] = malloc(slen + 1);
+    if (!dns_servers[i]) { error("[!] Out of memory"); }
+    memcpy(dns_servers[i], ns, slen + 1);
     i++;
   }
-  if (fclose(f))
-    error("[!] Error closing resolv.conf");
+  fclose(f);
 }
 
-// handle children
-void reaper_handle (int sig) {
-  (void) sig;
-  while (waitpid(-1, NULL, WNOHANG) > 0) { };
-}
-
-void tcp_query(void *query, response *buffer, int len) {
-  int sock;
+int tcp_query(void *query, response *buffer, int len, const char *nameserver) {
+  int sock, rc = -1;
   struct sockaddr_in socks_server;
   char tmp[1024];
 
@@ -164,41 +198,117 @@ void tcp_query(void *query, response *buffer, int len) {
   socks_server.sin_addr.s_addr = inet_addr(SOCKS_ADDR);
 
   sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) 
-    error("[!] Error creating TCP socket");
+  if (sock < 0) return errno;
 
-  if (connect(sock, (struct sockaddr*)&socks_server, sizeof(socks_server)) < 0)
-    error("[!] Error connecting to proxy");
-  
+  if (connect(sock, (struct sockaddr*)&socks_server, sizeof(socks_server)) < 0) {
+	  rc = errno;
+	  goto out;
+  }
+
   // socks handshake
-  send(sock, "\x05\x01\x00", 3, 0);
-  recv(sock, tmp, 1024, 0);
+  if (send(sock, "\x05\x01\x00", 3, 0) < 0) {
+	  rc = errno;
+	  goto out;
+  }
 
-  srand(time(NULL));
+  int datlen = recv(sock, tmp, 1024, 0);
+  if (datlen < 0) {
+	  rc = errno;
+	  goto out;
+  } else if (!datlen) {
+	  goto out;
+  } else if (datlen != 2 || tmp[0] != 5 || tmp[1] != 0) {
+	  mylog("SOCKS v5 handshake data error");
+	  goto out;
+  }
 
-  // select random dns server
-  in_addr_t remote_dns = inet_addr(dns_servers[rand() % (NUM_DNS - 1)]);
+  in_addr_t remote_dns = inet_addr(nameserver);
   memcpy(tmp, "\x05\x01\x00\x01", 4);
   memcpy(tmp + 4, &remote_dns, 4);
   memcpy(tmp + 8, "\x00\x35", 2);
 
-  if (LOG == 1) { fprintf(LOG_FILE, "Using DNS server: %s\n", inet_ntoa(*(struct in_addr *)&remote_dns)); }
+  mylog("Using DNS server: %s (%X)", nameserver, remote_dns);
 
-  send(sock, tmp, 10, 0);
-  recv(sock, tmp, 1024, 0);
+  if (send(sock, tmp, 10, 0) < 0) {
+	  rc = errno;
+	  goto out;
+  }
+  datlen = recv(sock, tmp, 1024, 0);	// 05 00 00 01 00 00 00 00 00 00
+  if (datlen < 0) {
+	  rc = errno;
+	  goto out;
+  } else if (!datlen) {
+	  goto out;
+  } else if (datlen != 10 || memcmp(tmp, "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00", datlen)) {
+	  mylog("SOCKS v5 response data error");
+	  goto out;
+  }
 
   // forward dns query
-  send(sock, query, len, 0);
+  if (send(sock, query, len, 0) < 0) {
+	  rc = errno;
+	  goto out;
+  }
   buffer->length = recv(sock, buffer->buffer, 2048, 0);
+  if (buffer->length < 0) {
+	  rc = errno;
+  } else {
+	  rc = 0;
+  }
+
+out:
+  shutdown(sock, SHUT_WR);
+  close(sock);
+  return rc;
 }
 
-int udp_listener() {
-  int sock;
-  char len, *query;
-  response *buffer = (response*)malloc(sizeof(response));
-  struct sockaddr_in dns_listener, dns_client;
+static void *query_thread(void *arg) {
+	queryargs *qa = (queryargs *) arg;
+	int start = m_cur_dns, i, rc;
+	uint8_t b = 0;
+	response buffer;
 
-  buffer->buffer = malloc(2048);
+	buffer.length = 2048;
+	buffer.buffer = malloc(buffer.length);
+	if (!buffer.buffer) { mylog("Out of memory"); exit(500); }
+
+	time_t st = time(NULL);
+	for (i = start;; i++) {
+		if (i >= NUM_DNS) { i = 0; }
+		if (b) {
+			if (i == start) { break; }
+			if (time(NULL) - st >= 30) { break; }
+		} else {
+			b = 1;
+		}
+		// forward the packet to the tcp dns server
+		rc = tcp_query(qa->resp.buffer, &buffer, qa->resp.length, dns_servers[i]);
+		if (rc) {
+			mylog("tcp_query DNS %s failed: %s", dns_servers[i], rc < 0 ? "Connection reset" : strerror(rc));
+		} else {
+			m_cur_dns = i;
+			// send the reply back to the client (minus the length at the beginning)
+			rc = sendto(qa->sock, buffer.buffer + 2, buffer.length - 2, 0, (struct sockaddr *)&qa->client, sizeof(qa->client));
+			if (rc < 0) { mylog("send DNS reply to client failed: %d %s", rc, strerror(rc)); }
+			break;
+		}
+	}
+
+	free(buffer.buffer);
+	free(qa->resp.buffer);
+	free(qa);
+	return NULL;
+}
+
+void udp_listener() {
+  int sock, rc, len;
+  response buffer;
+  struct sockaddr_in dns_listener, dns_client;
+  queryargs *qa;
+
+  buffer.length = 2048;
+  buffer.buffer = malloc(buffer.length);
+  if (!buffer.buffer) { error("[!] Out of memory"); }
 
   memset(&dns_listener, 0, sizeof(dns_listener));
   dns_listener.sin_family = AF_INET;
@@ -214,70 +324,79 @@ int udp_listener() {
     error("[!] Error binding on dns proxy");
 
   FILE *resolv = fopen(m_local_resolvconf, "w");
-
   if (!resolv)
     fprintf(stderr, "[!] Error opening %s: %s\n", m_local_resolvconf, strerror(errno));
   else {
-    fprintf(resolv, "nameserver %s\n", LISTEN_ADDR);
+    fprintf(resolv, "nameserver %s\n", strcmp(LISTEN_ADDR, "0.0.0.0") ? LISTEN_ADDR : "127.0.0.1");
     fclose(resolv);
   }
 
-  if (strcmp(LOGFILE, "/dev/null") != 0) {
-    LOG      = 1;
+  if (strcmp(LOGFILE, "/dev/null")) {
     LOG_FILE = fopen(LOGFILE, "a+");
     if (!LOG_FILE)
       error("[!] Error opening logfile.");
   }
 
-  printf("[*] No errors, backgrounding process.\n");
+  if (!getuid()) {
+    if (setgid(getgrnam(GROUPNAME)->gr_gid) < 0) { fprintf(stderr, "setgid failed: %s\n", strerror(errno)); }
+    if (setuid(getpwnam(USERNAME)->pw_uid) < 0) { fprintf(stderr, "setuid failed: %s\n", strerror(errno)); }
+  } else {
+    printf("[!] Only root can run as %s:%s\n", USERNAME, GROUPNAME);
+  }
 
   // daemonize the process.
-  if(fork() != 0) { exit(0); }
-  if(fork() != 0) { exit(0); }
+  if (m_daemonize) {
+	printf("[*] Backgrounding process.\n");
 
-  setuid(getpwnam(USERNAME)->pw_uid);
-  setgid(getgrnam(GROUPNAME)->gr_gid);
-  socklen_t dns_client_size = sizeof(struct sockaddr_in);
+	close(STDIN_FILENO);
+	if (open("/dev/null", O_RDWR, 0) != STDIN_FILENO) { fprintf(stderr, "Can't set stdin\n"); }
+	close(STDOUT_FILENO);
+	if (dup(STDIN_FILENO) != STDOUT_FILENO) { fprintf(stderr, "Can't set stdout\n"); }
+	close(STDERR_FILENO);
+	if (dup(STDIN_FILENO) != STDERR_FILENO) { fprintf(stderr, "Can't set stderr\n"); }
 
-  // setup SIGCHLD handler to kill off zombie children
-  struct sigaction reaper;
-  memset(&reaper, 0, sizeof(struct sigaction));
-  reaper.sa_handler = reaper_handle;
-  sigaction(SIGCHLD, &reaper, 0);
+	if(fork() != 0) { exit(0); }
+	if(fork() != 0) { exit(0); }
+  } else {
+	printf("[*] Run in foreground.\n");
+  }
 
-  while(1) {
+  socklen_t dns_client_size;
+
+  pthread_t pthid;
+  pthread_attr_t thattr;
+  pthread_attr_init(&thattr);
+  pthread_attr_setstacksize(&thattr, 32768);
+
+  for (;;) {
+    dns_client_size = sizeof(struct sockaddr_in);
     // receive a dns request from the client
-    len = recvfrom(sock, buffer->buffer, 2048, 0, (struct sockaddr *)&dns_client, &dns_client_size);
-
-    // lets not fork if recvfrom was interrupted
-    if (len < 0 && errno == EINTR) { continue; }
+    len = recvfrom(sock, buffer.buffer, buffer.length, 0, (struct sockaddr *)&dns_client, &dns_client_size);
 
     // other invalid values from recvfrom
     if (len < 0) {
-      if (LOG == 1) { fprintf(LOG_FILE, "recvfrom failed: %s\n", strerror(errno)); }
+      if (errno != EINTR) { mylog("recvfrom failed: %s", strerror(errno)); }
+      continue;
+    } else if (!len || len >= buffer.length) {
       continue;
     }
 
-    // fork so we can keep receiving requests
-    if (fork() != 0) { continue; }
+    qa = calloc(1, sizeof(*qa));
+    if (!qa) { mylog("Out of memory"); exit(500); }
+    qa->resp.length = len + 2;
+    qa->resp.buffer = malloc(qa->resp.length);
+    if (!qa->resp.buffer) { mylog("Out of memory"); exit(500); }
+    *((uint16_t *) qa->resp.buffer) = htons(len);
+    memcpy(qa->resp.buffer + 2, buffer.buffer, len);
+    qa->sock = sock;
+    memcpy(&qa->client, &dns_client, sizeof(struct sockaddr_in));
 
-    // the tcp query requires the length to precede the packet, so we put the length there
-    query = malloc(len + 3);
-    query[0] = 0;
-    query[1] = len;
-    memcpy(query + 2, buffer->buffer, len);
-
-    // forward the packet to the tcp dns server
-    tcp_query(query, buffer, len + 2);
-
-    // send the reply back to the client (minus the length at the beginning)
-    sendto(sock, buffer->buffer + 2, buffer->length - 2, 0, (struct sockaddr *)&dns_client, sizeof(dns_client));
-
-    free(buffer->buffer);
-    free(buffer);
-    free(query);
-
-    exit(0);
+    rc = pthread_create(&pthid, &thattr, query_thread, qa);
+    if (rc) {
+    	mylog("pthread_create failed: %d %s", rc, strerror(rc));
+    	free(qa->resp.buffer);
+    	free(qa);
+    }
   }
 }
 
@@ -313,15 +432,9 @@ int main(int argc, char *argv[]) {
       printf("   * log_file     = /dev/null\n");
       printf("   * local_resolv_conf = /etc/resolv.conf\n");
       exit(0);
-    }
-    else {
+    } else {
       parse_config(argv[1]);
     }
-  }
-
-  if (getuid() != 0) {
-    printf("Error: this program must be run as root! Quitting\n");
-    exit(1);
   }
 
   printf("[*] Listening on: %s:%d\n", LISTEN_ADDR, LISTEN_PORT);
