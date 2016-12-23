@@ -217,7 +217,7 @@ int tcp_query(void *query, response *buffer, int len, const char *nameserver) {
 	  goto out;
   } else if (!datlen) {
 	  goto out;
-  } else if (datlen != 2 || tmp[0] != 5 || tmp[1] != 0) {
+  } else if (datlen != 2 || tmp[0] != 5 || tmp[1]) {
 	  mylog("SOCKS v5 handshake data error");
 	  goto out;
   }
@@ -239,7 +239,7 @@ int tcp_query(void *query, response *buffer, int len, const char *nameserver) {
 	  goto out;
   } else if (!datlen) {
 	  goto out;
-  } else if (datlen != 10 || memcmp(tmp, "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00", datlen)) {
+  } else if (datlen != 10 || memcmp(tmp, "\x05\x00\x00\x01", 4)) {
 	  mylog("SOCKS v5 response data error");
 	  goto out;
   }
@@ -284,12 +284,16 @@ static void *query_thread(void *arg) {
 		// forward the packet to the tcp dns server
 		rc = tcp_query(qa->resp.buffer, &buffer, qa->resp.length, dns_servers[i]);
 		if (rc) {
-			mylog("tcp_query DNS %s failed: %s", dns_servers[i], rc < 0 ? "Connection reset" : strerror(rc));
+			mylog("tcp_query DNS %s failed: %d %s", dns_servers[i], rc, rc < 0 ? "Connection reset" : strerror(rc));
+			if (rc == ECONNREFUSED) { break; }
 		} else {
 			m_cur_dns = i;
 			// send the reply back to the client (minus the length at the beginning)
 			rc = sendto(qa->sock, buffer.buffer + 2, buffer.length - 2, 0, (struct sockaddr *)&qa->client, sizeof(qa->client));
-			if (rc < 0) { mylog("send DNS reply to client failed: %d %s", rc, strerror(rc)); }
+			if (rc < 0) {
+				rc = errno;
+				mylog("send DNS reply to client failed: %d %s", rc, strerror(rc));
+			}
 			break;
 		}
 	}
