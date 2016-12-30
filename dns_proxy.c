@@ -29,31 +29,28 @@
 #include <sys/types.h>
 #include <pwd.h>
 #include <grp.h>
-#include <time.h>
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include "coroutine_int.h"
 
-int SOCKS_PORT = 9050;
-char *SOCKS_ADDR = "127.0.0.1";
-int LISTEN_PORT = 53;
-char *LISTEN_ADDR = "0.0.0.0";
+static int SOCKS_PORT = 9050;
+static char *SOCKS_ADDR = "127.0.0.1";
+static int LISTEN_PORT = 53;
+static char *LISTEN_ADDR = "0.0.0.0";
 
-FILE *LOG_FILE = NULL;
-char *RESOLVCONF = "resolv.conf";
-char *LOGFILE = "/dev/null";
-char *USERNAME = "nobody";
-char *GROUPNAME = "nobody";
-int NUM_DNS = 0;
-char **dns_servers = NULL;
+static FILE *LOG_FILE = NULL;
+static char *RESOLVCONF = "resolv.conf";
+static char *LOGFILE = "/dev/null";
+static char *USERNAME = "nobody";
+static char *GROUPNAME = "nobody";
+static int NUM_DNS = 0;
+static char **dns_servers = NULL;
 static char *m_local_resolvconf = "/etc/resolv.conf";
 static uint8_t m_daemonize = 1;
-
-#define FDIN  1
-#define FDOUT 2
 
 struct QueryContext {
 	struct sockaddr_in client;
@@ -64,7 +61,8 @@ struct QueryContext {
 	uint8_t events;
 	uint8_t finish;
 	uint16_t buflen;
-	uint8_t buf[8];
+	uint16_t fdidx;
+	uint8_t buf[6];
 };
 
 static int m_listenfd = -1;
@@ -75,7 +73,7 @@ static inline void error_exit(const char *e) {
 	exit(EXIT_FAILURE);
 }
 
-void mylog(const char *message, ...) {
+static void mylog(const char *message, ...) {
 	if (!LOG_FILE) { return; }
 
 	va_list ap;
@@ -90,11 +88,11 @@ void mylog(const char *message, ...) {
 	}
 }
 
-char *get_value(char *line) {
+static char *get_value(char *line) {
 	char *token, *tmp;
 	token = strtok(line, " ");
 	for (;;) {
-		if ((tmp = strtok(NULL, " ")) == NULL)
+		if (!(tmp = strtok(NULL, " ")))
 			break;
 		else
 			token = tmp;
@@ -102,18 +100,17 @@ char *get_value(char *line) {
 	return token;
 }
 
-char *string_value(char *value) {
+static char *string_value(char *value) {
 	char *tmp = strdup(value);
-	if (!tmp) {
+	if (!tmp)
 		error_exit("[!] Out of memory");
-	}
 	value = tmp;
 	if (value[strlen(value) - 1] == '\n')
 		value[strlen(value) - 1] = '\0';
 	return value;
 }
 
-void parse_config(char *file) {
+static void parse_config(char *file) {
 	char line[128];
 	char *s;
 
@@ -153,7 +150,7 @@ void parse_config(char *file) {
 	fclose(f);
 }
 
-void parse_resolv_conf() {
+static void parse_resolv_conf() {
 	char ns[80];
 	int i = 0;
 	regex_t preg;
@@ -166,9 +163,8 @@ void parse_resolv_conf() {
 		exit(EXIT_FAILURE);
 	}
 
-	while (fgets(ns, 80, f) != NULL) {
-		if (!regexec(&preg, ns, 1, pmatch, 0))
-			NUM_DNS++;
+	while (fgets(ns, 80, f)) {
+		if (!regexec(&preg, ns, 1, pmatch, 0)) NUM_DNS++;
 	}
 	if (NUM_DNS < 1) {
 		fprintf(stderr, "[!] No name server in %s\n", RESOLVCONF);
@@ -176,23 +172,19 @@ void parse_resolv_conf() {
 	}
 
 	dns_servers = calloc(NUM_DNS, sizeof(char *));
-	if (!dns_servers) {
+	if (!dns_servers)
 		error_exit("[!] Out of memory");
-	}
 
 	rewind(f);
 	size_t slen;
-	while (fgets(ns, 80, f) != NULL) {
-		if (regexec(&preg, ns, 1, pmatch, 0) != 0)
-			continue;
+	while (fgets(ns, 80, f)) {
+		if (regexec(&preg, ns, 1, pmatch, 0)) continue;
 		slen = strlen(ns);
-		if (ns[slen - 1] == '\n') {
+		if (ns[slen - 1] == '\n')
 			ns[slen - 1] = '\0';
-		}
 		dns_servers[i] = malloc(slen + 1);
-		if (!dns_servers[i]) {
+		if (!dns_servers[i])
 			error_exit("[!] Out of memory");
-		}
 		memcpy(dns_servers[i], ns, slen + 1);
 		i++;
 	}
@@ -222,7 +214,7 @@ static inline int tcpclose(int sock) {
 	return close(sock);
 }
 
-int tcp_query(struct QueryContext *qctx, const char *nameserver) {
+static int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 	int sock, rc = -1, datlen;
 	uint16_t sl;
 	socklen_t scklen;
@@ -250,7 +242,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 	if (connect(sock, (struct sockaddr *) &socks_server, sizeof(socks_server)) < 0) {
 		rc = errno;
 		if (rc != EINPROGRESS) { goto out; }
-		qctx->events = FDOUT;
+		qctx->events = POLLOUT;
 		qemu_coroutine_yield();
 	}
 	datlen = 0;
@@ -268,7 +260,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (send(sock, "\x05\x01\x00", 3, 0) < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDOUT;
+			qctx->events = POLLOUT;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -280,7 +272,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (datlen < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDIN;
+			qctx->events = POLLIN;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -307,7 +299,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (send(sock, tmp, 10, 0) < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDOUT;
+			qctx->events = POLLOUT;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -319,7 +311,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (datlen < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDIN;
+			qctx->events = POLLIN;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -339,7 +331,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (send(sock, qctx->buf, qctx->buflen + 2, 0) < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDOUT;
+			qctx->events = POLLOUT;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -351,7 +343,7 @@ int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		if (datlen < 0) {
 			rc = errno;
 			if (rc != EAGAIN) { goto out; }
-			qctx->events = FDIN;
+			qctx->events = POLLIN;
 			qemu_coroutine_yield();
 		} else {
 			break;
@@ -413,13 +405,21 @@ static void query_thread(void *arg) {
 	qctx->finish = 1;
 }
 
+static inline void delete_job(struct QueryContext *qctx) {
+	if (!qctx->finish) { qemu_coroutine_delete(qctx->co); }
+	QLIST_REMOVE(qctx, next);
+	if (qctx->fd >= 0) { tcpclose(qctx->fd); }
+	if (qctx->replydata) { free(qctx->replydata); }
+	free(qctx);
+}
+
 static void udp_listener() {
 	struct sockaddr_in dns_listener, dns_client;
 	socklen_t scklen;
-	uint8_t recvbuf[1504], haswr, haserr;
-	int rc, len, max_fd;
-	fd_set rdset, wrset, errset;
-	struct timeval timeout;
+	uint8_t recvbuf[1504], haswr;
+	int rc, len, i;
+	struct pollfd *fds;
+	uint16_t maxfds = 16, dlen;
 	struct QueryContext *qctx, *qctx2;
 
 	memset(&dns_listener, 0, sizeof(dns_listener));
@@ -476,106 +476,146 @@ static void udp_listener() {
 		printf("[*] Run in foreground.\n");
 	}
 
-	for (;;) {
-		FD_ZERO(&rdset);
-		FD_ZERO(&wrset);
-		FD_ZERO(&errset);
+	fds = malloc(sizeof(*fds) * maxfds);
+	if (!fds) {
+		mylog("Out of memory");
+		exit(500);
+	}
 
-		FD_SET(m_listenfd, &rdset);
-		max_fd = m_listenfd;
+	for (;;) {
+		fds[0].fd = m_listenfd;
+		fds[0].events = POLLIN;
+		fds[0].revents = 0;
+		len = 1;
 		haswr = 0;
 
 		QLIST_FOREACH(qctx, &m_queries, next) {
-			if (qctx->fd >= 0) {
-				if (qctx->events & FDIN) { FD_SET(qctx->fd, &rdset); }
-				if (qctx->events & FDOUT) { FD_SET(qctx->fd, &wrset); }
-				FD_SET(qctx->fd, &errset);
-				if (qctx->fd > max_fd) { max_fd = qctx->fd; }
+			if (qctx->replydata) {
+				haswr = 1;
+			} else if (qctx->finish) {
+				qctx2 = qctx;
+				qctx = *qctx->next.le_prev;
+				delete_job(qctx2);
+				continue;
 			}
-			if (qctx->replydata) { haswr = 1; }
+
+			if (qctx->fd >= 0) {
+				if (len >= maxfds) {
+					fds = realloc(fds, sizeof(*fds) * maxfds * 2);
+					if (!fds) {
+						mylog("Out of memory");
+						exit(500);
+					}
+					maxfds *= 2;
+				}
+				fds[len].fd = qctx->fd;
+				fds[len].events = 0;
+				fds[len].revents = 0;
+				if (qctx->events & POLLIN) { fds[len].events |= POLLIN; }
+				if (qctx->events & POLLOUT) { fds[len].events |= POLLOUT; }
+				qctx->fdidx = len;
+				len++;
+			} else {
+				qctx->fdidx = 0;
+			}
 		}
-		if (haswr) { FD_SET(m_listenfd, &wrset); }
 
-		timeout.tv_sec = 3;
-		timeout.tv_usec = 0;
+		if (haswr) { fds[0].events |= POLLOUT; }
 
-		if (select(max_fd + 1, &rdset, &wrset, &errset, &timeout) < 0) {
+		if (poll(fds, len, 3000) < 0) {
 			rc = errno;
-			mylog("select FDs error: %d %s", rc, strerror(rc));
+			mylog("poll error: %d %s", rc, strerror(rc));
 			sleep(1);
 			continue;
 		}
 
-		if (FD_ISSET(m_listenfd, &rdset)) {
-			scklen = sizeof(dns_client);
-			len = recvfrom(m_listenfd, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *) &dns_client, &scklen);
-			if (len < 0) {
-				rc = errno;
-				mylog("recv DNS request error: %d %s", rc, strerror(rc));
-			} else if (!len || len >= (int) sizeof(recvbuf)) {
-				mylog("recv DNS request failed: length=%d", len);
-			} else {
-				qctx = malloc(sizeof(*qctx) + len);
-				if (!qctx) {
-					mylog("Out of memory");
-					exit(500);
+		for (i = 0; i < len; i++) {
+			if (!fds[i].revents) { continue; }
+			if (fds[i].revents & (POLLERR | POLLHUP)) {
+				if (!i) {
+					mylog("Local listener error! Quiting");
+					exit(400);
 				}
-				qctx->fd = -1;
-				qctx->finish = 0;
-				qctx->replydata = NULL;
-				memcpy(&qctx->client, &dns_client, sizeof(dns_client));
-				qctx->events = 0;
-				qctx->buflen = len;
-				memcpy(qctx->buf + 2, recvbuf, len);
-				qctx->co = qemu_coroutine_create(query_thread);
-				QLIST_INSERT_HEAD(&m_queries, qctx, next);
-				qemu_coroutine_enter(qctx->co, qctx);
-			}
-		} else if (haswr && FD_ISSET(m_listenfd, &wrset)) {
-			QLIST_FOREACH(qctx, &m_queries, next) {
-				if (!qctx->replydata) { continue; }
-				len = ntohs(*((uint16_t *) qctx->replydata));
-				rc = sendto(m_listenfd, qctx->replydata + 2, len, 0, (struct sockaddr *) &qctx->client,
-						sizeof(qctx->client));
-				if (rc < 0) {
-					rc = errno;
-					if (rc == EAGAIN) { break; }
-					mylog("send DNS reply to client failed: %d %s", rc, strerror(rc));
-				} else if (rc != len) {
-					mylog("send DNS reply to client failed: only send %d/%d", rc, len);
-				}
-				free(qctx->replydata);
-				qctx->replydata = NULL;
-			}
-		}
 
-		QLIST_FOREACH(qctx, &m_queries, next) {
-			haserr = (qctx->fd >= 0 && FD_ISSET(qctx->fd, &errset));
-
-			if (haserr || (qctx->finish && !qctx->replydata)) {
-				qctx2 = qctx;
-				qctx = *qctx->next.le_prev;
-				if (!qctx2->finish) { qemu_coroutine_delete(qctx2->co); }
-				QLIST_REMOVE(qctx2, next);
-				if (haserr) {
-					scklen = sizeof(rc);
-					if (getsockopt(qctx2->fd, SOL_SOCKET, SO_ERROR, &rc, &scklen) < 0) {
-						rc = errno;
-						mylog("getsockopt failed: %d %s", rc, strerror(rc));
-					} else {
-						mylog("sock error: %d %s", rc, strerror(rc));
+				QLIST_FOREACH(qctx, &m_queries, next) {
+					if (qctx->fdidx == (uint16_t) i) {
+						scklen = sizeof(rc);
+						if (getsockopt(qctx->fd, SOL_SOCKET, SO_ERROR, &rc, &scklen) < 0) {
+							rc = errno;
+							mylog("getsockopt failed: %d %s", rc, strerror(rc));
+						} else {
+							mylog("sock error: %d %s", rc, strerror(rc));
+						}
+						delete_job(qctx);
+						break;
 					}
 				}
-				if (qctx2->fd >= 0) { tcpclose(qctx2->fd); }
-				if (qctx2->replydata) { free(qctx2->replydata); }
-				free(qctx2);
-				continue;
-			}
+			} else if (fds[i].revents & POLLIN) {
+				if (!i) {
+					scklen = sizeof(dns_client);
+					rc = recvfrom(m_listenfd, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *) &dns_client,
+							&scklen);
+					if (rc < 0) {
+						rc = errno;
+						mylog("recv DNS request error: %d %s", rc, strerror(rc));
+					} else if (!rc || rc >= (int) sizeof(recvbuf)) {
+						mylog("recv DNS request failed: length=%d", rc);
+					} else {
+						qctx = malloc(sizeof(*qctx) + rc);
+						if (!qctx) {
+							mylog("Out of memory");
+							exit(500);
+						}
+						qctx->fd = -1;
+						qctx->finish = 0;
+						qctx->replydata = NULL;
+						memcpy(&qctx->client, &dns_client, sizeof(dns_client));
+						qctx->events = 0;
+						qctx->fdidx = 0;
+						qctx->buflen = rc;
+						memcpy(qctx->buf + 2, recvbuf, rc);
+						qctx->co = qemu_coroutine_create(query_thread);
+						QLIST_INSERT_HEAD(&m_queries, qctx, next);
+						qemu_coroutine_enter(qctx->co, qctx);
+					}
+					continue;
+				}
 
-			if (qctx->fd >= 0 && (FD_ISSET(qctx->fd, &rdset) || FD_ISSET(qctx->fd, &wrset)))
-				qemu_coroutine_enter(qctx->co, qctx);
-		}
-	}
+				QLIST_FOREACH(qctx, &m_queries, next) {
+					if (qctx->fdidx == (uint16_t) i) {
+						qemu_coroutine_enter(qctx->co, qctx);
+						break;
+					}
+				}
+			} else if (fds[i].revents & POLLOUT) {
+				if (!i) {
+					QLIST_FOREACH(qctx, &m_queries, next) {
+						if (!qctx->replydata) { continue; }
+						dlen = ntohs(*((uint16_t *) qctx->replydata));
+						rc = sendto(m_listenfd, qctx->replydata + 2, dlen, 0,
+								(struct sockaddr *) &qctx->client, sizeof(qctx->client));
+						if (rc < 0) {
+							rc = errno;
+							if (rc == EAGAIN) { break; }
+							mylog("send DNS reply to client failed: %d %s", rc, strerror(rc));
+						} else if ((uint16_t) rc != dlen) {
+							mylog("send DNS reply to client failed: only send %d/%hu", rc, dlen);
+						}
+						free(qctx->replydata);
+						qctx->replydata = NULL;
+					}
+					continue;
+				}
+
+				QLIST_FOREACH(qctx, &m_queries, next) {
+					if (qctx->fdidx == (uint16_t) i) {
+						qemu_coroutine_enter(qctx->co, qctx);
+						break;
+					}
+				}
+			}
+		}	// end for
+	}	// end for
 }
 
 int main(int argc, char *argv[]) {
