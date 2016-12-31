@@ -6,7 +6,7 @@ It chooses a random DNS server for each request from the file "resolv.conf" whic
 
 The daemon must be run as root in order for it to bind to port 53.
 
-Can use in Linux, Unix, and OpenWRT.
+Qiuyi: Can use in Linux, Unix, and OpenWRT. I have already tested in Ubuntu, RedHat, macOS 10.12, and OpenWRT 15.05 (mips)
 
 ## Usage
 

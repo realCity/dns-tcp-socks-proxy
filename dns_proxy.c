@@ -410,6 +410,9 @@ static inline void delete_job(struct QueryContext *qctx) {
 	QLIST_REMOVE(qctx, next);
 	if (qctx->fd >= 0) { tcpclose(qctx->fd); }
 	if (qctx->replydata) { free(qctx->replydata); }
+#ifdef _DEBUG
+	printf("free QueryContext %p\n", qctx);
+#endif
 	free(qctx);
 }
 
@@ -566,6 +569,9 @@ static void udp_listener() {
 							mylog("Out of memory");
 							exit(500);
 						}
+#ifdef _DEBUG
+						printf("malloc QueryContext %p\n", qctx);
+#endif
 						qctx->fd = -1;
 						qctx->finish = 0;
 						qctx->replydata = NULL;

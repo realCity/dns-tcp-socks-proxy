@@ -26,7 +26,11 @@
 #include <setjmp.h>
 #include <stdint.h>
 #include <pthread.h>
-#include <ucontext.h>
+#if defined(__mips__) || defined(__arm__)
+# include "context.h"
+#else
+# include <ucontext.h>
+#endif
 #include <errno.h>
 #include "coroutine_int.h"
 
@@ -183,6 +187,9 @@ static inline void valgrind_stack_deregister(CoroutineUContext *co)
 
 void qemu_coroutine_delete(Coroutine *co_)
 {
+#ifdef _DEBUG
+	printf("qemu_coroutine_delete %p\n", co_);
+#endif
     CoroutineUContext *co = DO_UPCAST(CoroutineUContext, base, co_);
 
 #ifdef CONFIG_VALGRIND_H

@@ -81,7 +81,15 @@ Coroutine *qemu_coroutine_create(CoroutineEntry *entry) {
 
 	if (!co) {
 		co = qemu_coroutine_new();
+#ifdef _DEBUG
+		printf("qemu_coroutine_new %p\n", co);
+#endif
 	}
+#ifdef _DEBUG
+	else {
+		printf("reuse qemu_coroutine %p\n", co);
+	}
+#endif
 
 	co->entry = entry;
 	QTAILQ_INIT(&co->co_queue_wakeup);
@@ -159,6 +167,9 @@ static void coroutine_swap(Coroutine *from, Coroutine *to) {
 }
 
 void qemu_coroutine_enter(Coroutine *co, void *opaque) {
+#ifdef _DEBUG
+	printf("qemu_coroutine_enter %p\n", co);
+#endif
 	Coroutine *self = qemu_coroutine_self();
 
 	//trace_qemu_coroutine_enter(self, co, opaque);
@@ -175,6 +186,9 @@ void qemu_coroutine_enter(Coroutine *co, void *opaque) {
 
 void coroutine_fn qemu_coroutine_yield(void) {
 	Coroutine *self = qemu_coroutine_self();
+#ifdef _DEBUG
+	printf("qemu_coroutine_yield %p\n", self);
+#endif
 	Coroutine *to = self->caller;
 
 	//trace_qemu_coroutine_yield(self, to);

@@ -1,14 +1,46 @@
-UNAME_S := $(shell uname -s)
-FLAGS = -Wall -Wextra
-
-ifeq ($(UNAME_S),Darwin)
-	FLAGS += -D_XOPEN_SOURCE
+ifeq "$(ARCH)" ""
+	override ARCH := $(shell uname -m)
 endif
 
-all:
-	$(CC) $(FLAGS) -I. -o dns_proxy coroutine-ucontext.c qemu-coroutine.c dns_proxy.c
+CFLAGS=-Wall -c -I.
+AS=$(CC) -c
+LIBS=
+DNSPROXY=dns_proxy.o coroutine-ucontext.o qemu-coroutine.o
+
+LIB=libtask.a
+ifeq ($(ARCH),mips)
+	ASM=asm.o
+	OFILES=$(ASM) context.o
+endif
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+	CFLAGS += -D_XOPEN_SOURCE
+else
+	LIBS+=-pthread
+endif
+
+all: $(LIB) dns_proxy
+
+%.o: %.S
+	$(AS) $*.S
+
+%.o: %.c
+	$(CC) $(CFLAGS) $*.c
+
+$(LIB): $(OFILES)
+ifeq ($(ARCH),mips)
+	ar rvc $(LIB) $(OFILES)
+endif
+
+dns_proxy: $(DNSPROXY) $(LIB)
+ifeq ($(ARCH),mips)
+	$(CC) $(LIBS) -o dns_proxy $(DNSPROXY) $(LIB)
+else
+	$(CC) $(LIBS) -o dns_proxy $(DNSPROXY)
+endif
 
 .PHONY: clean
 
 clean:
-	-rm dns_proxy
+	-rm -f dns_proxy *.o *.a
