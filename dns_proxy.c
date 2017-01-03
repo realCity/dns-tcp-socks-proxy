@@ -110,13 +110,13 @@ static char *string_value(char *value) {
 	return value;
 }
 
-static void parse_config(char *file) {
+static void parse_config(const char *file) {
 	char line[128];
 	char *s;
 
 	FILE *f = fopen(file, "r");
 	if (!f) {
-		fprintf(stderr, "[!] Error opening configuration file %s: %s", file, strerror(errno));
+		fprintf(stderr, "[!] Error opening configuration file %s: %s\n", file, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
@@ -454,9 +454,18 @@ static void udp_listener() {
 	}
 
 	if (!getuid()) {
-		if (setgid(getgrnam(GROUPNAME)->gr_gid) < 0)
+		struct group *grp = getgrnam(GROUPNAME);
+		if (!grp) {
+			fprintf(stderr, "[!] Group (%s) does not exist! Quiting\n", GROUPNAME);
+			exit(EXIT_FAILURE);
+		} else if (setgid(grp->gr_gid) < 0)
 			fprintf(stderr, "setgid failed: %s\n", strerror(errno));
-		if (setuid(getpwnam(USERNAME)->pw_uid) < 0)
+
+		struct passwd *usr = getpwnam(USERNAME);
+		if (!usr) {
+			fprintf(stderr, "[!] Username (%s) does not exist! Quiting\n", USERNAME);
+			exit(EXIT_FAILURE);
+		} else if (setuid(usr->pw_uid) < 0)
 			fprintf(stderr, "setuid failed: %s\n", strerror(errno));
 	} else {
 		printf("[!] Only root can run as %s:%s\n", USERNAME, GROUPNAME);
@@ -624,41 +633,62 @@ static void udp_listener() {
 	}	// end for
 }
 
+static void usage(char *argv[]) {
+	printf("Usage: %s [options]\n", argv[0]);
+	printf(" * With no parameters, the configuration file is read from 'dns_proxy.conf'.\n\n");
+	printf(" -n          -- No configuration file (socks: 127.0.0.1:9999, listener: 0.0.0.0:53).\n");
+	printf(" -h          -- Print this message and exit.\n");
+	printf(" config_file -- Read from specified configuration file.\n\n");
+	printf(" * The configuration file should contain any of the following options (and ignores lines that begin with '#'):\n");
+	printf("   * socks_addr  -- socks listener address\n");
+	printf("   * socks_port  -- socks listener port\n");
+	printf("   * listen_addr -- address for the dns proxy to listen on\n");
+	printf("   * listen_port -- port for the dns proxy to listen on (most cases 53)\n");
+	printf("   * set_user    -- username to drop to after binding\n");
+	printf("   * set_group   -- group to drop to after binding\n");
+	printf("   * resolv_conf -- location of resolv.conf to read from\n");
+	printf("   * log_file    -- location to log server IPs to. (only necessary for debugging)\n\n");
+	printf(" * Configuration directives should be of the format:\n");
+	printf("   option = value\n\n");
+	printf(" * Any non-specified options will be set to their defaults:\n");
+	printf("   * socks_addr   = 127.0.0.1\n");
+	printf("   * socks_port   = 9050\n");
+	printf("   * listen_addr  = 0.0.0.0\n");
+	printf("   * listen_port  = 53\n");
+	printf("   * set_user     = nobody\n");
+	printf("   * set_group    = nobody\n");
+	printf("   * resolv_conf  = resolv.conf\n");
+	printf("   * log_file     = /dev/null\n");
+	printf("   * local_resolv_conf = /etc/resolv.conf\n");
+}
+
 int main(int argc, char *argv[]) {
 	if (argc == 1)
 		parse_config("dns_proxy.conf");
-	else if (argc == 2) {
-		if (!strcmp(argv[1], "-h")) {
-			printf("Usage: %s [options]\n", argv[0]);
-			printf(" * With no parameters, the configuration file is read from 'dns_proxy.conf'.\n\n");
-			printf(" -n          -- No configuration file (socks: 127.0.0.1:9999, listener: 0.0.0.0:53).\n");
-			printf(" -h          -- Print this message and exit.\n");
-			printf(" config_file -- Read from specified configuration file.\n\n");
-			printf(" * The configuration file should contain any of the following options (and ignores lines that begin with '#'):\n");
-			printf("   * socks_addr  -- socks listener address\n");
-			printf("   * socks_port  -- socks listener port\n");
-			printf("   * listen_addr -- address for the dns proxy to listen on\n");
-			printf("   * listen_port -- port for the dns proxy to listen on (most cases 53)\n");
-			printf("   * set_user    -- username to drop to after binding\n");
-			printf("   * set_group   -- group to drop to after binding\n");
-			printf("   * resolv_conf -- location of resolv.conf to read from\n");
-			printf("   * log_file    -- location to log server IPs to. (only necessary for debugging)\n\n");
-			printf(" * Configuration directives should be of the format:\n");
-			printf("   option = value\n\n");
-			printf(" * Any non-specified options will be set to their defaults:\n");
-			printf("   * socks_addr   = 127.0.0.1\n");
-			printf("   * socks_port   = 9050\n");
-			printf("   * listen_addr  = 0.0.0.0\n");
-			printf("   * listen_port  = 53\n");
-			printf("   * set_user     = nobody\n");
-			printf("   * set_group    = nobody\n");
-			printf("   * resolv_conf  = resolv.conf\n");
-			printf("   * log_file     = /dev/null\n");
-			printf("   * local_resolv_conf = /etc/resolv.conf\n");
-			exit(0);
-		} else {
-			parse_config(argv[1]);
+	else if (argc >= 2) {
+		uint8_t foreground = 0;
+		int ch;
+		while ((ch = getopt(argc, argv, "hnfc:")) != -1) {
+			switch (ch) {
+			case 'h':
+				usage(argv);
+				exit(0);
+			case 'n':
+				break;
+			case 'f':
+				foreground = 1;
+				break;
+			case 'c':
+				parse_config(optarg);
+				break;
+			default:
+				usage(argv);
+				exit(1);
+			}
 		}
+		argc -= optind;
+		argv += optind;
+		if (foreground) { m_daemonize = 0; }
 	}
 
 	printf("[*] Listening on: %s:%d\n", LISTEN_ADDR, LISTEN_PORT);
@@ -666,15 +696,6 @@ int main(int argc, char *argv[]) {
 	printf("[*] Will drop priviledges to %s:%s\n", USERNAME, GROUPNAME);
 	parse_resolv_conf();
 	printf("[*] Loaded %d DNS servers from %s.\n\n", NUM_DNS, RESOLVCONF);
-
-	if (!getpwnam(USERNAME)) {
-		printf("[!] Username (%s) does not exist! Quiting\n", USERNAME);
-		exit(EXIT_FAILURE);
-	}
-	if (!getgrnam(GROUPNAME)) {
-		printf("[!] Group (%s) does not exist! Quiting\n", GROUPNAME);
-		exit(EXIT_FAILURE);
-	}
 
 	// start the dns proxy
 	udp_listener();

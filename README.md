@@ -16,7 +16,7 @@ With no parameters, the configuration file is read from 'dns_proxy.conf'.
 
 * -n          -- No configuration file (socks: 127.0.0.1:9050, listener: 0.0.0.0:53).
 * -h          -- Print this message and exit.
-* config_file -- Read from specified configuration file.
+* -c file     -- Read from specified configuration file.
 
 ## Configuration
 
