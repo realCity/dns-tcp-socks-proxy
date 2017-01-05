@@ -638,7 +638,8 @@ static void usage(char *argv[]) {
 	printf(" * With no parameters, the configuration file is read from 'dns_proxy.conf'.\n\n");
 	printf(" -n          -- No configuration file (socks: 127.0.0.1:9999, listener: 0.0.0.0:53).\n");
 	printf(" -h          -- Print this message and exit.\n");
-	printf(" config_file -- Read from specified configuration file.\n\n");
+	printf(" -c file     -- Read from specified configuration file.\n");
+	printf(" -f          -- Run in foreground.\n\n");
 	printf(" * The configuration file should contain any of the following options (and ignores lines that begin with '#'):\n");
 	printf("   * socks_addr  -- socks listener address\n");
 	printf("   * socks_port  -- socks listener port\n");
