@@ -35,6 +35,7 @@
 #include <stdarg.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <time.h>
 #include "coroutine_int.h"
 
 static int SOCKS_PORT = 9050;
@@ -73,15 +74,44 @@ static inline void error_exit(const char *e) {
 	exit(EXIT_FAILURE);
 }
 
-static void mylog(const char *message, ...) {
-	if (!LOG_FILE) { return; }
+static inline void get_time_str(char tmstr[22]) {
+	struct tm t;
+	struct timespec ts;
+	size_t slen;
 
+	memset(&t, 0, sizeof(t));
+#ifdef CLOCK_REALTIME
+	if (clock_gettime(CLOCK_REALTIME, &ts)) {
+		perror("get CLOCK_REALTIME error");
+		memset(&ts, 0, sizeof(ts));
+	}
+#else
+	memset(&ts, 0, sizeof(ts));
+	ts.tv_sec = time(NULL);
+#endif
+	localtime_r(&ts.tv_sec, &t);
+	tmstr[0] = '\0';
+	slen = strftime(tmstr, 22, "%y-%m-%d %T", &t);
+
+	if (slen > 0) {
+		snprintf(tmstr + slen, 22 - slen, ".%03ld", ts.tv_nsec / 1000000);
+	}
+}
+
+static void mylog(const char *message, ...) {
+	int ret;
 	va_list ap;
+	char tmstr[22];
+	if (!LOG_FILE) { return; }
+	get_time_str(tmstr);
+	if (fprintf(LOG_FILE, "%s: ", tmstr) < 0) {
+		perror("write log file error");
+	}
 	va_start(ap, message);
-	int ret = vfprintf(LOG_FILE, message, ap);
+	ret = vfprintf(LOG_FILE, message, ap);
 	va_end(ap);
 	if (ret < 0) {
-		fprintf(stderr, "write log file error\n");
+		perror("write log file error");
 	} else {
 		fputc('\n', LOG_FILE);
 		fflush(LOG_FILE);
@@ -189,6 +219,7 @@ static void parse_resolv_conf() {
 		i++;
 	}
 	fclose(f);
+	regfree(&preg);
 }
 
 static inline int tcpnodelay(int sock) {
