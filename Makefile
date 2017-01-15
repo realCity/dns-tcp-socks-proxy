@@ -4,8 +4,8 @@ endif
 
 CFLAGS=-Wall -c -I.
 AS=$(CC) -c
-LIBS=
-DNSPROXY=dns_proxy.o coroutine-ucontext.o qemu-coroutine.o
+LIBS=-lresolv
+DNSPROXY=dns_proxy.o coroutine-ucontext.o qemu-coroutine.o local_ns_parser.o
 
 LIB=libtask.a
 ifeq ($(ARCH),mips)
@@ -17,7 +17,7 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 	CFLAGS += -D_XOPEN_SOURCE
 else
-	LIBS+=-pthread
+	LIBS += -pthread
 endif
 
 all: $(LIB) dns_proxy

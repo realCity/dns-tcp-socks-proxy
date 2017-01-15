@@ -36,7 +36,9 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <time.h>
+#include <resolv.h>
 #include "coroutine_int.h"
+#include "local_ns_parser.h"
 
 static int SOCKS_PORT = 9050;
 static char *SOCKS_ADDR = "127.0.0.1";
@@ -52,6 +54,7 @@ static int NUM_DNS = 0;
 static char **dns_servers = NULL;
 static char *m_local_resolvconf = "/etc/resolv.conf";
 static uint8_t m_daemonize = 1;
+static uint8_t m_verbose = 0;
 
 struct QueryContext {
 	struct sockaddr_in client;
@@ -98,7 +101,13 @@ static inline void get_time_str(char tmstr[22]) {
 	}
 }
 
-static void mylog(const char *message, ...) {
+static inline uint8_t mylog_enable(void) {
+	return LOG_FILE ? 1 : 0;
+}
+
+#define mylog(M, S...) _mylog(1, M, S)
+#define mylog_s(M) _mylog(1, M)
+static void _mylog(uint8_t newline, const char *message, ...) {
 	int ret;
 	va_list ap;
 	char tmstr[22];
@@ -112,7 +121,7 @@ static void mylog(const char *message, ...) {
 	va_end(ap);
 	if (ret < 0) {
 		perror("write log file error");
-	} else {
+	} else if (newline) {
 		fputc('\n', LOG_FILE);
 		fflush(LOG_FILE);
 	}
@@ -313,7 +322,7 @@ static int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		rc = ECONNRESET;
 		goto out;
 	} else if (datlen != 2 || tmp[0] != 5 || tmp[1]) {
-		mylog("SOCKS5 handshake data error");
+		mylog_s("SOCKS5 handshake data error");
 		goto out;
 	}
 
@@ -352,7 +361,7 @@ static int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		rc = ECONNRESET;
 		goto out;
 	} else if (datlen != 10 || memcmp(tmp, "\x05\x00\x00\x01", 4)) {
-		mylog("SOCKS5 reply data error");
+		mylog_s("SOCKS5 reply data error");
 		goto out;
 	}
 
@@ -393,7 +402,7 @@ static int tcp_query(struct QueryContext *qctx, const char *nameserver) {
 		} else {
 			qctx->replydata = malloc(datlen);
 			if (!qctx->replydata) {
-				mylog("Out of memory");
+				mylog_s("Out of memory");
 				exit(500);
 			} else {
 				memcpy(qctx->replydata, tmp, datlen);
@@ -409,11 +418,102 @@ out:
 	return rc;
 }
 
+static char *hostname_buf = NULL;
+static size_t hostname_buflen = 0;
+static const char *hostname_from_question(ns_msg msg) {
+	ns_rr rr;
+	int rrnum, rrmax;
+	const char *result;
+	int result_len;
+	rrmax = ns_msg_count(msg, ns_s_qd);
+	for (rrnum = 0; rrnum < rrmax; rrnum++) {
+		if (local_ns_parserr(&msg, ns_s_qd, rrnum, &rr)) {
+			result_len = errno;
+			mylog("local_ns_parserr error: %d %s", result_len, strerror(result_len));
+			return NULL;
+		}
+		result = ns_rr_name(rr);
+		result_len = strlen(result) + 1;
+		if (result_len > hostname_buflen) {
+			hostname_buflen = result_len << 1;
+			hostname_buf = realloc(hostname_buf, hostname_buflen);
+			if (!hostname_buf) {
+				mylog_s("Out of memory");
+				exit(500);
+			}
+		}
+		memcpy(hostname_buf, result, result_len);
+		return hostname_buf;
+	}
+	return NULL;
+}
+
+static void log_question(const struct QueryContext *qctx) {
+	int rc;
+	ns_msg msg;
+	const char *str;
+
+	if (!mylog_enable()) return;
+
+	if (local_ns_initparse(qctx->buf + 2, qctx->buflen, &msg) < 0) {
+		rc = errno;
+		mylog("local_ns_initparse error: %d %s", rc, strerror(rc));
+		return;
+	}
+
+	str = hostname_from_question(msg);
+	if (!str) str = "";
+	mylog("request 0x%hX %s", ns_msg_id(msg), str);
+}
+
+static void log_answer(const struct QueryContext *qctx, int dnsidx) {
+	int rc, rrmax, rrnum;
+	ns_msg msg;
+	const char *str;
+	uint16_t dlen;
+	ns_rr rr;
+	uint8_t b = 0;
+
+	if (!mylog_enable() || !qctx->replydata) return;
+
+	dlen = ntohs(*((uint16_t *) qctx->replydata));
+	if (local_ns_initparse(qctx->replydata + 2, dlen, &msg) < 0) {
+		rc = errno;
+		mylog("local_ns_initparse error: %d %s", rc, strerror(rc));
+		return;
+	}
+
+	str = hostname_from_question(msg);
+	if (!str) str = "";
+	_mylog(0, "response 0x%hX %s from %s:53 - ", ns_msg_id(msg), str, dns_servers[dnsidx]);
+	rrmax = ns_msg_count(msg, ns_s_an);
+
+	for (rrnum = 0; rrnum < rrmax; rrnum++) {
+		if (local_ns_parserr(&msg, ns_s_an, rrnum, &rr)) {
+			rc = errno;
+			mylog("\nlocal_ns_parserr error: %d %s", rc, strerror(rc));
+			continue;
+		}
+		if (ns_rr_type(rr) != ns_t_a) continue;
+		if (b) {
+			fputs(", ", LOG_FILE);
+		} else {
+			b = 1;
+		}
+		fputs(inet_ntoa(*(struct in_addr *) ns_rr_rdata(rr)), LOG_FILE);
+	}
+
+	fputc('\n', LOG_FILE);
+	fflush(LOG_FILE);
+}
+
 static void query_thread(void *arg) {
 	struct QueryContext *qctx = arg;
 	static int m_cur_dns = 0;
 	int start = m_cur_dns, i, rc;
 	uint8_t b = 0;
+
+	if (m_verbose) log_question(qctx);
 
 	for (i = start;; i++) {
 		if (i >= NUM_DNS) { i = 0; }
@@ -429,6 +529,7 @@ static void query_thread(void *arg) {
 			if (rc == ECONNREFUSED) { break; }
 		} else {
 			m_cur_dns = i;
+			if (m_verbose) log_answer(qctx, i);
 			break;
 		}
 	}
@@ -521,7 +622,7 @@ static void udp_listener() {
 
 	fds = malloc(sizeof(*fds) * maxfds);
 	if (!fds) {
-		mylog("Out of memory");
+		mylog_s("Out of memory");
 		exit(500);
 	}
 
@@ -546,7 +647,7 @@ static void udp_listener() {
 				if (len >= maxfds) {
 					fds = realloc(fds, sizeof(*fds) * maxfds * 2);
 					if (!fds) {
-						mylog("Out of memory");
+						mylog_s("Out of memory");
 						exit(500);
 					}
 					maxfds *= 2;
@@ -576,20 +677,13 @@ static void udp_listener() {
 			if (!fds[i].revents) { continue; }
 			if (fds[i].revents & (POLLERR | POLLHUP)) {
 				if (!i) {
-					mylog("Local listener error! Quiting");
+					mylog_s("Local listener error! Quiting");
 					exit(400);
 				}
 
 				QLIST_FOREACH(qctx, &m_queries, next) {
 					if (qctx->fdidx == (uint16_t) i) {
-						scklen = sizeof(rc);
-						if (getsockopt(qctx->fd, SOL_SOCKET, SO_ERROR, &rc, &scklen) < 0) {
-							rc = errno;
-							mylog("getsockopt failed: %d %s", rc, strerror(rc));
-						} else {
-							mylog("sock error: %d %s", rc, strerror(rc));
-						}
-						delete_job(qctx);
+						qemu_coroutine_enter(qctx->co, qctx);
 						break;
 					}
 				}
@@ -606,7 +700,7 @@ static void udp_listener() {
 					} else {
 						qctx = malloc(sizeof(*qctx) + rc);
 						if (!qctx) {
-							mylog("Out of memory");
+							mylog_s("Out of memory");
 							exit(500);
 						}
 #ifdef _DEBUG
@@ -670,7 +764,8 @@ static void usage(char *argv[]) {
 	printf(" -n          -- No configuration file (socks: 127.0.0.1:9999, listener: 0.0.0.0:53).\n");
 	printf(" -h          -- Print this message and exit.\n");
 	printf(" -c file     -- Read from specified configuration file.\n");
-	printf(" -f          -- Run in foreground.\n\n");
+	printf(" -f          -- Run in foreground.\n");
+	printf(" -v          -- verbose logging.\n\n");
 	printf(" * The configuration file should contain any of the following options (and ignores lines that begin with '#'):\n");
 	printf("   * socks_addr  -- socks listener address\n");
 	printf("   * socks_port  -- socks listener port\n");
@@ -700,7 +795,7 @@ int main(int argc, char *argv[]) {
 	else if (argc >= 2) {
 		uint8_t foreground = 0;
 		int ch;
-		while ((ch = getopt(argc, argv, "hnfc:")) != -1) {
+		while ((ch = getopt(argc, argv, "hnfc:v")) != -1) {
 			switch (ch) {
 			case 'h':
 				usage(argv);
@@ -712,6 +807,9 @@ int main(int argc, char *argv[]) {
 				break;
 			case 'c':
 				parse_config(optarg);
+				break;
+			case 'v':
+				m_verbose = 1;
 				break;
 			default:
 				usage(argv);
