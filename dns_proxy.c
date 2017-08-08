@@ -147,6 +147,8 @@ static char *string_value(char *value) {
 	value = tmp;
 	if (value[strlen(value) - 1] == '\n')
 		value[strlen(value) - 1] = '\0';
+	if (strcmp(value, "") == 0)
+		return NULL;
 	return value;
 }
 
@@ -572,12 +574,16 @@ static void udp_listener() {
 	else if (bind(m_listenfd, (struct sockaddr *) &dns_listener, sizeof(dns_listener)) < 0)
 		error_exit("[!] Error binding on dns proxy");
 
-	FILE *resolv = fopen(m_local_resolvconf, "w");
-	if (!resolv)
-		fprintf(stderr, "[!] Error opening %s: %s\n", m_local_resolvconf, strerror(errno));
-	else {
-		fprintf(resolv, "nameserver %s\n", strcmp(LISTEN_ADDR, "0.0.0.0") ? LISTEN_ADDR : "127.0.0.1");
-		fclose(resolv);
+	if(m_local_resolvconf != NULL) {
+		FILE *resolv = fopen(m_local_resolvconf, "w");
+		if (!resolv) {
+			fprintf(stderr, "[!] Error opening %s: %s\n", m_local_resolvconf, strerror(errno));
+			mylog("Overwrote local resolv.conf: %s", m_local_resolvconf);
+		} else {
+			mylog("Overwrote local resolv.conf: %s", m_local_resolvconf);
+			fprintf(resolv, "nameserver %s\n", strcmp(LISTEN_ADDR, "0.0.0.0") ? LISTEN_ADDR : "127.0.0.1");
+			fclose(resolv);
+		}
 	}
 
 	if (strcmp(LOGFILE, "/dev/null")) {
@@ -586,22 +592,25 @@ static void udp_listener() {
 			error_exit("[!] Error opening logfile.");
 	}
 
-	if (!getuid()) {
-		struct group *grp = getgrnam(GROUPNAME);
-		if (!grp) {
-			fprintf(stderr, "[!] Group (%s) does not exist! Quiting\n", GROUPNAME);
-			exit(EXIT_FAILURE);
-		} else if (setgid(grp->gr_gid) < 0)
-			fprintf(stderr, "setgid failed: %s\n", strerror(errno));
+	if(USERNAME != NULL && GROUPNAME != NULL) {
+		if (!getuid()) {
+			struct group *grp = getgrnam(GROUPNAME);
+			if (!grp) {
+				fprintf(stderr, "[!] Group (%s) does not exist! Quiting\n", GROUPNAME);
+				exit(EXIT_FAILURE);
+			} else if (setgid(grp->gr_gid) < 0)
+				fprintf(stderr, "setgid failed: %s\n", strerror(errno));
 
-		struct passwd *usr = getpwnam(USERNAME);
-		if (!usr) {
-			fprintf(stderr, "[!] Username (%s) does not exist! Quiting\n", USERNAME);
-			exit(EXIT_FAILURE);
-		} else if (setuid(usr->pw_uid) < 0)
-			fprintf(stderr, "setuid failed: %s\n", strerror(errno));
-	} else {
-		printf("[!] Only root can run as %s:%s\n", USERNAME, GROUPNAME);
+			struct passwd *usr = getpwnam(USERNAME);
+			if (!usr) {
+				fprintf(stderr, "[!] Username (%s) does not exist! Quiting\n", USERNAME);
+				exit(EXIT_FAILURE);
+			} else if (setuid(usr->pw_uid) < 0)
+				fprintf(stderr, "setuid failed: %s\n", strerror(errno));
+		} else {
+			printf("[!] Only root can run as %s:%s\n", USERNAME, GROUPNAME);
+				exit(EXIT_FAILURE);
+		}
 	}
 
 	// daemonize the process.
@@ -873,7 +882,32 @@ int main(int argc, char *argv[]) {
 
 	printf("[*] Listening on: %s:%d\n", LISTEN_ADDR, LISTEN_PORT);
 	printf("[*] Using SOCKS proxy: %s:%d\n", SOCKS_ADDR, SOCKS_PORT);
-	printf("[*] Will drop priviledges to %s:%s\n", USERNAME, GROUPNAME);
+	if(USERNAME != NULL && GROUPNAME != NULL)
+		printf("[*] Will drop priviledges to %s:%s\n", USERNAME, GROUPNAME);
+	else {
+		struct group *grp = getgrgid(getgid());
+		struct passwd *pwd = getpwuid(getuid());
+		const char *username = NULL;
+		const char *groupname = NULL;
+		char groupname_buf[100] = "";
+		char username_buf[100] = "";
+
+		if(grp == NULL) {
+			int ret = snprintf(groupname_buf, 100, "%i", getgid());
+			groupname = ret > 0 && ret < 100 ? groupname_buf : "?";
+		} else {
+			groupname = grp->gr_name;
+		}
+
+		if(pwd == NULL) {
+			int ret = snprintf(username_buf, 100, "%i", getuid());
+			username = ret > 0 && ret < 100 ? username_buf : "?";
+		} else {
+			username = pwd->pw_name;
+		}
+
+		printf("[*] Keeping existing priviledges as %s:%s\n", username, groupname);
+	}
 	parse_resolv_conf();
 	printf("[*] Loaded %d DNS servers from %s.\n\n", NUM_DNS, RESOLVCONF);
 
